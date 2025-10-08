@@ -27,7 +27,7 @@ def export(
         typer.Option(
             "-b", "--batch-size", min=0, help="Batch size of exported ONNX model. Set to 0 to mark as dynamic."
         ),
-    ] = 0,
+    ] = 1,
     height: Annotated[
         int, typer.Option("-h", "--height", min=0, help="Height of input image. Set to 0 to mark as dynamic.")
     ] = 0,
@@ -47,13 +47,13 @@ def export(
     opset: Annotated[int, typer.Option(min=16, max=20, help="ONNX opset version of exported model.")] = 17,
     fp16: Annotated[bool, typer.Option("--fp16", help="Whether to also convert to FP16.")] = False,
 ):
-    """Export LightGlue to ONNX."""
+    """Export LightGlue extractor and matcher as separate ONNX models for template matching."""
     import onnx
     import torch
     from onnxruntime.tools.symbolic_shape_infer import SymbolicShapeInference
     from onnxruntime.transformers.float16 import convert_float_to_float16
 
-    from lightglue_dynamo.models import DISK, LightGlue, Pipeline, SuperPoint
+    from lightglue_dynamo.models import DISK, LightGlue, SuperPoint
     from lightglue_dynamo.ops import use_fused_multi_head_attention
 
     match extractor_type:
@@ -62,12 +62,19 @@ def export(
         case Extractor.disk:
             extractor = DISK(num_keypoints=num_keypoints)
     matcher = LightGlue(**extractor_type.lightglue_config)
-    pipeline = Pipeline(extractor, matcher).eval()
+    
+    extractor = extractor.eval()
+    matcher = matcher.eval()
 
+    # Set output paths
     if output is None:
-        output = Path(f"weights/{extractor_type}_lightglue_pipeline.onnx")
+        extractor_output = Path(f"weights/{extractor_type}_extractor.onnx")
+        matcher_output = Path(f"weights/{extractor_type}_lightglue_matcher.onnx")
+    else:
+        base_path = output.with_suffix('')
+        extractor_output = Path(f"{base_path}_extractor.onnx")
+        matcher_output = Path(f"{base_path}_matcher.onnx")
 
-    check_multiple_of(batch_size, 2)
     check_multiple_of(height, extractor_type.input_dim_divisor)
     check_multiple_of(width, extractor_type.input_dim_divisor)
 
@@ -82,32 +89,79 @@ def export(
             raise typer.Abort("Fused multi-head attention requires PyTorch 2.4 or later.")
         use_fused_multi_head_attention()
 
-    dynamic_axes = {"images": {}, "keypoints": {}}
+    # Export extractor model
+    typer.echo(f"Exporting extractor model...")
+    extractor_dynamic_axes = {"image": {}}
     if batch_size == 0:
-        dynamic_axes["images"][0] = "batch_size"
-        dynamic_axes["keypoints"][0] = "batch_size"
+        extractor_dynamic_axes["image"][0] = "batch_size"
     if height == 0:
-        dynamic_axes["images"][2] = "height"
+        extractor_dynamic_axes["image"][2] = "height"
     if width == 0:
-        dynamic_axes["images"][3] = "width"
-    dynamic_axes |= {"matches": {0: "num_matches"}, "mscores": {0: "num_matches"}}
+        extractor_dynamic_axes["image"][3] = "width"
+    extractor_dynamic_axes |= {
+        "keypoints": {0: "batch_size", 1: "num_keypoints"},
+        "scores": {0: "batch_size", 1: "num_keypoints"},
+        "descriptors": {0: "batch_size", 1: "descriptor_dim", 2: "num_keypoints"}
+    }
+    
+    dummy_input = {"image": torch.zeros(batch_size or 1, extractor_type.input_channels, height or 256, width or 256)}
     torch.onnx.export(
-        pipeline,
-        torch.zeros(batch_size or 2, extractor_type.input_channels, height or 256, width or 256),
-        str(output),
-        input_names=["images"],
-        output_names=["keypoints", "matches", "mscores"],
+        extractor,
+        (dummy_input,),
+        str(extractor_output),
+        input_names=["image"],
+        output_names=["keypoints", "scores", "descriptors"],
         opset_version=opset,
-        dynamic_axes=dynamic_axes,
+        dynamic_axes=extractor_dynamic_axes,
     )
-    onnx.checker.check_model(output)
-    onnx.save_model(SymbolicShapeInference.infer_shapes(onnx.load_model(output), auto_merge=True), output)  # type: ignore
-    typer.echo(f"Successfully exported model to {output}")
+    onnx.checker.check_model(extractor_output)
+    onnx.save_model(SymbolicShapeInference.infer_shapes(onnx.load_model(extractor_output), auto_merge=True), extractor_output)  # type: ignore
+    typer.echo(f"✓ Successfully exported extractor to {extractor_output}")
+
+    # Export matcher model
+    typer.echo(f"Exporting matcher model...")
+    # Create dummy features for matcher
+    with torch.no_grad():
+        dummy_kpts, dummy_scores, dummy_desc = extractor(dummy_input["image"])
+    
+    # Normalize keypoints like in Pipeline: 2 * keypoints / size - 1
+    # LightGlue expects normalized coordinates in [-1, 1]
+    size = torch.tensor([width, height], device=dummy_kpts.device, dtype=torch.float32)
+    dummy_kpts_normalized = 2 * dummy_kpts.float() / size - 1
+    
+    # LightGlue expects interleaved batch: (2B, N, 2) for keypoints and (2B, N, D) for descriptors
+    # Concatenate features from two "images" (using same features for both)
+    dummy_kpts_interleaved = torch.cat([dummy_kpts_normalized, dummy_kpts_normalized], dim=0)  # (2B, N, 2)
+    dummy_desc_interleaved = torch.cat([dummy_desc, dummy_desc], dim=0)  # (2B, N, D)
+    
+    matcher_dynamic_axes = {
+        "keypoints": {0: "batch_x2", 1: "num_keypoints"},
+        "descriptors": {0: "batch_x2", 1: "num_keypoints"},
+        "matches": {0: "num_matches"},
+        "mscores": {0: "num_matches"}
+    }
+    
+    torch.onnx.export(
+        matcher,
+        (dummy_kpts_interleaved, dummy_desc_interleaved),
+        str(matcher_output),
+        input_names=["keypoints", "descriptors"],
+        output_names=["matches", "mscores"],
+        opset_version=opset,
+        dynamic_axes=matcher_dynamic_axes,
+    )
+    onnx.checker.check_model(matcher_output)
+    onnx.save_model(SymbolicShapeInference.infer_shapes(onnx.load_model(matcher_output), auto_merge=True), matcher_output)  # type: ignore
+    typer.echo(f"✓ Successfully exported matcher to {matcher_output}")
+    
     if fp16:
-        typer.echo(
-            "Converting to FP16. Warning: This FP16 model should NOT be used for TensorRT. TRT provides its own fp16 option."
-        )
-        onnx.save_model(convert_float_to_float16(onnx.load_model(output)), output.with_suffix(".fp16.onnx"))
+        typer.echo("Converting to FP16. Warning: This FP16 model should NOT be used for TensorRT. TRT provides its own fp16 option.")
+        onnx.save_model(convert_float_to_float16(onnx.load_model(extractor_output)), extractor_output.with_suffix(".fp16.onnx"))
+        onnx.save_model(convert_float_to_float16(onnx.load_model(matcher_output)), matcher_output.with_suffix(".fp16.onnx"))
+    
+    typer.echo(f"\n✓ Export complete! Two models created:")
+    typer.echo(f"  1. Extractor: {extractor_output}")
+    typer.echo(f"  2. Matcher: {matcher_output}")
 
 
 @app.command()
