@@ -265,8 +265,10 @@ class LightGlueTRT(nn.Module):
             descriptors = self.transformers[i](descriptors, encodings)
 
         scores = self.log_assignment[i](descriptors)  # (B, N, N)
-        matches, mscores = filter_matches(scores, self.filter_threshold)
-        return matches, mscores  # (M, 3), (M,)
+        
+        # Return raw score matrix - all matching logic happens in post-processing
+        # Shape: [B, N, N] - fully static, TRT-compatible
+        return scores
 
     def confidence_threshold(self, layer_index: int) -> float:
         """scaled confidence threshold"""

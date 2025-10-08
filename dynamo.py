@@ -46,6 +46,7 @@ def export(
     ] = False,
     opset: Annotated[int, typer.Option(min=16, max=20, help="ONNX opset version of exported model.")] = 17,
     fp16: Annotated[bool, typer.Option("--fp16", help="Whether to also convert to FP16.")] = False,
+    trt_compatible: Annotated[bool, typer.Option("--trt-compatible", help="Export TensorRT-compatible models (static shapes, returns score matrix).")] = False,
 ):
     """Export LightGlue extractor and matcher as separate ONNX models for template matching."""
     import onnx
@@ -55,25 +56,36 @@ def export(
 
     from lightglue_dynamo.models import DISK, LightGlue, SuperPoint
     from lightglue_dynamo.ops import use_fused_multi_head_attention
+    
+    # Conditionally import TRT model if needed
+    if trt_compatible:
+        from lightglue_dynamo.models.lightglue_trt import LightGlueTRT
 
     match extractor_type:
         case Extractor.superpoint:
             extractor = SuperPoint(num_keypoints=num_keypoints)
         case Extractor.disk:
             extractor = DISK(num_keypoints=num_keypoints)
-    matcher = LightGlue(**extractor_type.lightglue_config)
+    
+    # Use TRT-compatible matcher if requested
+    if trt_compatible:
+        matcher = LightGlueTRT(**extractor_type.lightglue_config)
+    else:
+        matcher = LightGlue(**extractor_type.lightglue_config)
     
     extractor = extractor.eval()
     matcher = matcher.eval()
 
     # Set output paths
     if output is None:
-        extractor_output = Path(f"weights/{extractor_type}_extractor.onnx")
-        matcher_output = Path(f"weights/{extractor_type}_lightglue_matcher.onnx")
+        suffix = "_trt" if trt_compatible else ""
+        extractor_output = Path(f"weights/{extractor_type}_extractor{suffix}.onnx")
+        matcher_output = Path(f"weights/{extractor_type}_lightglue_matcher{suffix}.onnx")
     else:
         base_path = output.with_suffix('')
-        extractor_output = Path(f"{base_path}_extractor.onnx")
-        matcher_output = Path(f"{base_path}_matcher.onnx")
+        suffix = "_trt" if trt_compatible else ""
+        extractor_output = Path(f"{base_path}_extractor{suffix}.onnx")
+        matcher_output = Path(f"{base_path}_matcher{suffix}.onnx")
 
     check_multiple_of(height, extractor_type.input_dim_divisor)
     check_multiple_of(width, extractor_type.input_dim_divisor)
@@ -134,19 +146,26 @@ def export(
     dummy_kpts_interleaved = torch.cat([dummy_kpts_normalized, dummy_kpts_normalized], dim=0)  # (2B, N, 2)
     dummy_desc_interleaved = torch.cat([dummy_desc, dummy_desc], dim=0)  # (2B, N, D)
     
-    matcher_dynamic_axes = {
-        "keypoints": {0: "batch_x2", 1: "num_keypoints"},
-        "descriptors": {0: "batch_x2", 1: "num_keypoints"},
-        "matches": {0: "num_matches"},
-        "mscores": {0: "num_matches"}
-    }
+    # TRT model returns just the score matrix [B, N, N]
+    # Non-TRT model returns matches [M, 3] and scores [M]
+    if trt_compatible:
+        output_names = ["scores"]
+        matcher_dynamic_axes = None  # All static for TRT
+    else:
+        output_names = ["matches", "mscores"]
+        matcher_dynamic_axes = {
+            "keypoints": {0: "batch_x2", 1: "num_keypoints"},
+            "descriptors": {0: "batch_x2", 1: "num_keypoints"},
+            "matches": {0: "num_matches"},
+            "mscores": {0: "num_matches"}
+        }
     
     torch.onnx.export(
         matcher,
         (dummy_kpts_interleaved, dummy_desc_interleaved),
         str(matcher_output),
         input_names=["keypoints", "descriptors"],
-        output_names=["matches", "mscores"],
+        output_names=output_names,
         opset_version=opset,
         dynamic_axes=matcher_dynamic_axes,
     )
