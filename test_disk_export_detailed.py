@@ -18,6 +18,7 @@ def test_disk_export():
     try:
         # Try importing DISK from the dynamo models
         from lightglue_dynamo.models.disk import DISK
+
         print("✅ Successfully imported DISK from lightglue_dynamo.models.disk")
 
         # Create a modified DISK class that loads weights on CPU
@@ -25,12 +26,12 @@ def test_disk_export():
             def __init__(self, **kwargs):
                 # Initialize without calling parent __init__ to avoid weight loading
                 torch.nn.Module.__init__(self)
-                
+
                 # Set up attributes
-                descriptor_dim = kwargs.get('descriptor_dim', 128)
-                nms_window_size = kwargs.get('nms_window_size', 5)
-                num_keypoints = kwargs.get('num_keypoints', 1024)
-                
+                descriptor_dim = kwargs.get("descriptor_dim", 128)
+                nms_window_size = kwargs.get("nms_window_size", 5)
+                num_keypoints = kwargs.get("num_keypoints", 1024)
+
                 if nms_window_size % 2 != 1:
                     raise ValueError(f"window_size has to be odd, got {nms_window_size}")
 
@@ -40,13 +41,14 @@ def test_disk_export():
 
                 # Import and create U-Net
                 from lightglue_dynamo.models.disk.unet import Unet
+
                 self.unet = Unet(in_features=3, size=5, down=[16, 32, 64, 64, 64], up=[64, 64, 64, descriptor_dim + 1])
 
                 # Load weights with CPU mapping
                 try:
-                    state_dict = torch.hub.load_state_dict_from_url(
-                        self.url, map_location=torch.device('cpu')
-                    )["extractor"]
+                    state_dict = torch.hub.load_state_dict_from_url(self.url, map_location=torch.device("cpu"))[
+                        "extractor"
+                    ]
                     self.load_state_dict(state_dict)
                     print("✅ Successfully loaded DISK weights")
                 except Exception as e:
@@ -105,6 +107,7 @@ def test_disk_export():
             # Try to load and validate the ONNX model
             try:
                 import onnx
+
                 onnx_model = onnx.load(output_path)
                 onnx.checker.check_model(onnx_model)
                 print("✅ ONNX model validation successful")
@@ -121,6 +124,7 @@ def test_disk_export():
             # Test with onnxruntime
             try:
                 import onnxruntime as ort
+
                 sess = ort.InferenceSession(output_path)
                 print("✅ ONNXRuntime can load the model")
 
@@ -140,7 +144,7 @@ def test_disk_export():
             print(f"❌ ONNX export failed: {e}")
             print("📋 Full traceback:")
             traceback.print_exc()
-            
+
             # Analyze the error for TensorRT compatibility insights
             error_str = str(e).lower()
             if "topk" in error_str:
@@ -151,7 +155,7 @@ def test_disk_export():
                 print("🔍 TensorRT Issue: scatter operations - not well supported")
             if "floor" in error_str or "ceil" in error_str:
                 print("🔍 TensorRT Issue: integer arithmetic operations")
-                
+
             return False
 
     except ImportError as e:
@@ -169,7 +173,7 @@ def test_disk_export():
 
 if __name__ == "__main__":
     success = test_disk_export()
-    print("\n" + "="*80)
+    print("\n" + "=" * 80)
     if success:
         print("✅ DISK CAN BE EXPORTED TO ONNX!")
         print("📋 Next step: Test conversion to TensorRT")
@@ -180,5 +184,5 @@ if __name__ == "__main__":
     else:
         print("❌ DISK CANNOT BE EXPORTED TO ONNX")
         print("   TensorRT export is not feasible")
-    
+
     sys.exit(0 if success else 1)
