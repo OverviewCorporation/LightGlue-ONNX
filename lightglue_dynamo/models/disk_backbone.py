@@ -27,7 +27,7 @@ class DISKBackbone(nn.Module):
         """Load DISK pretrained weights with CPU mapping"""
         try:
             # Use the DISK URL from the original implementation
-            url = "https://github.com/cvlab-epfl/disk/raw/master/depth-0.pt"
+            url = "https://raw.githubusercontent.com/cvlab-epfl/disk/master/depth-save.pth"
             state_dict = torch.hub.load_state_dict_from_url(url, map_location=torch.device("cpu"))["extractor"]
 
             self.load_state_dict(state_dict)
@@ -50,6 +50,6 @@ class DISKBackbone(nn.Module):
         """
         unet_output = self.unet(image)
         descriptors = unet_output[:, : self.descriptor_dim]  # (B, 128, H, W)
-        heatmaps = unet_output[:, self.descriptor_dim :]  # (B, 1, H, W)
+        heatmaps = unet_output[:, self.descriptor_dim]  # (B, H, W)
 
         return heatmaps, descriptors
