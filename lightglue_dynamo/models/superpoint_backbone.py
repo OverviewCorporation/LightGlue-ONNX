@@ -33,7 +33,7 @@ class SuperPointBackbone(nn.Module):
         self.conv4b = nn.Conv2d(c4, c4, kernel_size=3, stride=1, padding=1)
 
         self.convPa = nn.Conv2d(c4, c5, kernel_size=3, stride=1, padding=1)
-        self.convPb = nn.Conv2d(c5, 65, kernel_size=1, stride=1, padding=0)
+        self.convPb = nn.Conv2d(c5, 64, kernel_size=1, stride=1, padding=0)  # Changed from 65 to 64
 
         self.convDa = nn.Conv2d(c4, c5, kernel_size=3, stride=1, padding=1)
         self.convDb = nn.Conv2d(c5, self.descriptor_dim, kernel_size=1, stride=1, padding=0)
@@ -42,11 +42,27 @@ class SuperPointBackbone(nn.Module):
         self._load_weights()
 
     def _load_weights(self):
-        """Load SuperPoint pretrained weights"""
+        """Load SuperPoint pretrained weights with optimizations"""
         try:
             state_dict = torch.hub.load_state_dict_from_url(self.weights_url, map_location=torch.device("cpu"))
+
+            # Remove the 65th channel (dustbin) from convPb weights and bias
+            if "convPb.weight" in state_dict:
+                # Original shape: (65, 256, 1, 1) -> New shape: (64, 256, 1, 1)
+                state_dict["convPb.weight"] = state_dict["convPb.weight"][:64]
+                print(
+                    f"✅ Trimmed convPb.weight from {state_dict['convPb.weight'].shape[0] + 1} to {state_dict['convPb.weight'].shape[0]} channels"
+                )
+
+            if "convPb.bias" in state_dict:
+                # Original shape: (65,) -> New shape: (64,)
+                state_dict["convPb.bias"] = state_dict["convPb.bias"][:64]
+                print(
+                    f"✅ Trimmed convPb.bias from {state_dict['convPb.bias'].shape[0] + 1} to {state_dict['convPb.bias'].shape[0]} channels"
+                )
+
             self.load_state_dict(state_dict)
-            print("✅ Successfully loaded SuperPoint pretrained weights")
+            print("✅ Successfully loaded SuperPoint pretrained weights with dustbin removal")
         except Exception as e:
             print(f"⚠️  Could not load pretrained weights: {e}")
             print("   Proceeding with random weights for architecture testing...")
@@ -60,6 +76,8 @@ class SuperPointBackbone(nn.Module):
 
         Returns:
             tuple of (heatmaps, descriptors)
+            - heatmaps: Full resolution keypoint probability maps (B, H, W)
+            - descriptors: Feature descriptors (B, D, H//8, W//8)
         """
         # Convert RGB to grayscale (SuperPoint expects grayscale)
         # RGB to grayscale conversion: 0.299*R + 0.587*G + 0.114*B
@@ -79,9 +97,21 @@ class SuperPointBackbone(nn.Module):
         x = self.relu(self.conv4a(x))
         x = self.relu(self.conv4b(x))
 
-        # Keypoint detection head
+        # Keypoint detection head with baked-in softmax + reshaping
         cPa = self.relu(self.convPa(x))
-        heatmaps = self.convPb(cPa)
+        scores = self.convPb(cPa)  # (B, 64, H//8, W//8)
+
+        # Apply softmax and reshape to full resolution
+        scores = F.softmax(scores, dim=1)  # Softmax over 64 channels
+        b, _, h, w = scores.shape  # 64 channels
+        s = 8  # SuperPoint scale factor (8x8 = 64)
+
+        # Reshape from 64 channels of 8x8 patches to full resolution
+        heatmaps = (
+            scores.reshape(b, s, s, h, w)
+            .permute(0, 3, 1, 4, 2)  # (B, H, S, W, S)
+            .reshape(b, h * s, w * s)  # (B, H*8, W*8) - full resolution
+        )
 
         # Descriptor head
         cDa = self.relu(self.convDa(x))
